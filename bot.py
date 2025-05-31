@@ -4,8 +4,10 @@ import re
 import json
 import time
 import random
+import threading
 from typing import Dict, Optional, List, Any
 from datetime import datetime
+from http.server import HTTPServer, BaseHTTPRequestHandler
 
 # Load environment variables from .env file if it exists (for local development)
 try:
@@ -2502,6 +2504,10 @@ def main() -> None:
     load_persistent_data()
     load_config_data()  # Make sure to load configuration data as well
     
+    # Start health check server in background thread
+    health_thread = threading.Thread(target=start_health_server, daemon=True)
+    health_thread.start()
+    
     # Create the Updater and pass it your bot's token with more generous timeouts
     request_kwargs = {
         'read_timeout': 60,        # Increased from 30
@@ -2526,6 +2532,7 @@ def main() -> None:
         
         logger.info("✅ Bot initialized successfully")
         logger.info(f"📊 Current state: Groups A: {len(GROUP_A_IDS)}, Groups B: {len(GROUP_B_IDS)}")
+        logger.info(f"🌐 Health check available at: http://localhost:{PORT}/health")
         
         # Start the Bot
         logger.info("🚀 Starting bot polling...")
@@ -2969,6 +2976,36 @@ def schedule_message_deletion(context: CallbackContext, chat_id: int, message_id
             logger.info(f"✅ Successfully scheduled deletion job (fallback) for message {message_id}")
         except Exception as e2:
             logger.error(f"❌ Complete failure to schedule deletion: {e2}")
+
+# Simple health check server for Render
+class HealthCheckHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == "/health" or self.path == "/":
+            self.send_response(200)
+            self.send_header('Content-type', 'application/json')
+            self.end_headers()
+            response = {
+                "status": "healthy",
+                "service": "telegram-bot",
+                "groups_a": len(GROUP_A_IDS),
+                "groups_b": len(GROUP_B_IDS)
+            }
+            self.wfile.write(json.dumps(response).encode())
+        else:
+            self.send_response(404)
+            self.end_headers()
+    
+    def log_message(self, format, *args):
+        pass  # Suppress HTTP server logs
+
+def start_health_server():
+    """Start a simple HTTP server for health checks."""
+    try:
+        server = HTTPServer(('0.0.0.0', PORT), HealthCheckHandler)
+        logger.info(f"🌐 Health check server starting on port {PORT}")
+        server.serve_forever()
+    except Exception as e:
+        logger.error(f"Failed to start health server: {e}")
 
 if __name__ == '__main__':
     main() 
