@@ -399,10 +399,17 @@ def help_command(update: Update, context: CallbackContext) -> None:
 /setgroupbpercent <group_b_id> <percentage> - Set percentage chance (0-100) for a Group B
 /resetgroupbpercent - Reset all Group B percentages to normal
 /listgroupbpercent - List all Group B percentage settings
+/resetqueue - Reset image queue to start from beginning
+/queuestatus - Show current queue status and order
 /debug - Debug information
 /dreset - Reset all image statuses
 开启转发/关闭转发 - Toggle forwarding between Group B and Group A
 设置群聊A/设置群聊B - Set current chat as Group A or Group B
+
+*How Images Work:*
+📋 Images are sent in QUEUE ORDER (setup order), one by one
+🔄 When all images are used, it cycles back to the first image
+🎯 This ensures fair distribution in the order images were created
 """
 
     update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
@@ -613,12 +620,12 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
         # This is a simplified approach - you might want to implement something more robust
         logger.info(f"Multiple Group B chats detected: {GROUP_B_IDS}")
     
-    # Use the new ascending order function with percentage support
-    image = db.get_next_open_image_ascending_with_percentage(group_b_percentages)
+    # Use the new queue-based function with percentage support (creation order)
+    image = db.get_next_image_in_queue_with_percentage(group_b_percentages)
     
     if not image:
         # If no image found with percentage constraints, try without constraints
-        image = db.get_next_open_image_ascending()
+        image = db.get_next_image_in_queue()
         
     if not image:
         update.message.reply_text("No open images available.")
@@ -2354,6 +2361,10 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(CommandHandler("resetgroupbpercent", handle_reset_group_b_percentages))
     dispatcher.add_handler(CommandHandler("listgroupbpercent", handle_list_group_b_percentages))
     
+    # Queue management commands (for global admins only)
+    dispatcher.add_handler(CommandHandler("resetqueue", handle_reset_queue))
+    dispatcher.add_handler(CommandHandler("queuestatus", handle_queue_status))
+    
     # Handler for admin image sending
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'^发图'),
@@ -3006,6 +3017,74 @@ def start_health_server():
         server.serve_forever()
     except Exception as e:
         logger.error(f"Failed to start health server: {e}")
+
+def handle_reset_queue(update: Update, context: CallbackContext) -> None:
+    """Reset the image queue to start from the beginning."""
+    user_id = update.message.from_user.id
+    
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    try:
+        success = db.reset_queue_positions()
+        if success:
+            update.message.reply_text("✅ Image queue has been reset. Next image will start from the first image in setup order.")
+            logger.info(f"Global admin {user_id} reset the image queue")
+        else:
+            update.message.reply_text("❌ Failed to reset image queue")
+            
+    except Exception as e:
+        logger.error(f"Error in handle_reset_queue: {e}")
+        update.message.reply_text("❌ Error resetting image queue")
+
+def handle_queue_status(update: Update, context: CallbackContext) -> None:
+    """Show current queue status."""
+    user_id = update.message.from_user.id
+    
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    try:
+        status = db.get_queue_status()
+        
+        if "error" in status:
+            update.message.reply_text(f"❌ Queue Status Error: {status['error']}")
+            return
+        
+        message = f"📋 Queue Status:\n\n"
+        message += f"🔢 Total Images: {status['total_images']}\n"
+        message += f"🟢 Open Images: {status['open_images']}\n"
+        message += f"🔴 Closed Images: {status['closed_images']}\n"
+        message += f"📍 Max Position: {status['max_position']}\n\n"
+        
+        if status['current_image']:
+            message += f"📌 Last Sent Image:\n"
+            message += f"   🆔 ID: {status['current_image']['id']}\n"
+            message += f"   🔢 Number: {status['current_image']['number']}\n"
+            message += f"   ⚡ Status: {status['current_image']['status']}\n"
+            message += f"   📍 Position: {status['current_image']['position']}\n\n"
+        
+        if status['next_image']:
+            message += f"⏭️ Next Image (OPEN only):\n"
+            message += f"   🆔 ID: {status['next_image']['id']}\n"
+            message += f"   🔢 Number: {status['next_image']['number']}\n"
+            message += f"   ⚡ Status: {status['next_image']['status']}\n\n"
+        else:
+            message += f"⚠️ No open images available for next send\n\n"
+        
+        message += f"📜 Queue Order (Setup Order):\n"
+        for i, img in enumerate(status['queue_order'], 1):
+            position_text = f" (pos: {img['position']})" if img['position'] > 0 else ""
+            status_emoji = "🟢" if img['status'] == 'open' else "🔴"
+            message += f"{i}. {status_emoji} Group {img['number']}{position_text}\n"
+        
+        update.message.reply_text(message)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_queue_status: {e}")
+        update.message.reply_text("❌ Error getting queue status")
 
 if __name__ == '__main__':
     main() 
