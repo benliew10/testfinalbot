@@ -1,6 +1,6 @@
 import json
 import os
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Any
 import random
 import logging
 import sqlite3
@@ -740,3 +740,245 @@ def get_next_open_image_ascending_with_percentage(group_b_percentages: Dict = No
     except Exception as e:
         logger.error(f"Error getting next open image with percentage: {e}")
         return None 
+
+def get_next_image_in_queue() -> Optional[Dict]:
+    """Get the next image in queue order (setup/creation order), cycling through all images, but only consider OPEN images."""
+    try:
+        init_db()  # Make sure the database exists
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Add queue_position column if it doesn't exist
+        cursor.execute("PRAGMA table_info(images)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'queue_position' not in columns:
+            cursor.execute("ALTER TABLE images ADD COLUMN queue_position INTEGER DEFAULT 0")
+            conn.commit()
+            logger.info("Added queue_position column to images table")
+        
+        # Get all images ordered by rowid (creation order) - ALL images for position tracking
+        if 'metadata' in columns:
+            cursor.execute("SELECT rowid, image_id, number, file_id, status, metadata, queue_position FROM images ORDER BY rowid ASC")
+        else:
+            cursor.execute("SELECT rowid, image_id, number, file_id, status, queue_position FROM images ORDER BY rowid ASC")
+        
+        all_rows = cursor.fetchall()
+        
+        if not all_rows:
+            logger.info("No images available in queue")
+            conn.close()
+            return None
+        
+        # Filter to only get OPEN images for selection
+        open_rows = [row for row in all_rows if row[4] == 'open']  # status is at index 4
+        
+        if not open_rows:
+            logger.info("No open images available in queue")
+            conn.close()
+            return None
+        
+        # Find the last sent image (highest queue_position) among ALL images
+        max_position = max(row[-1] or 0 for row in all_rows)  # queue_position is last column
+        
+        # Find next OPEN image in queue after the last sent position
+        next_image = None
+        
+        if max_position == 0:
+            # No images sent yet, start with first open image
+            next_image = open_rows[0]
+            logger.info("Starting queue from first open image")
+        else:
+            # Find the image with max_position
+            last_sent_rowid = None
+            for row in all_rows:
+                if (row[-1] or 0) == max_position:
+                    last_sent_rowid = row[0]  # rowid
+                    break
+            
+            if last_sent_rowid is not None:
+                # Find the next OPEN image after the last sent image
+                for row in open_rows:
+                    if row[0] > last_sent_rowid:  # rowid comparison
+                        next_image = row
+                        logger.info(f"Found next open image after rowid {last_sent_rowid}")
+                        break
+                
+                # If no open image found after last sent, cycle back to first open image
+                if not next_image and open_rows:
+                    next_image = open_rows[0]
+                    logger.info("Cycling back to first open image")
+            
+            # Fallback if we couldn't find the last sent image
+            if not next_image and open_rows:
+                next_image = open_rows[0]
+                logger.info("Fallback: using first open image")
+        
+        if not next_image:
+            logger.info("No suitable next image found")
+            conn.close()
+            return None
+        
+        # Build image dict
+        image = {
+            'image_id': next_image[1],
+            'number': next_image[2],
+            'file_id': next_image[3],
+            'status': next_image[4],
+            'rowid': next_image[0]
+        }
+        
+        # Add metadata if available
+        if 'metadata' in columns and len(next_image) > 5 and next_image[5]:
+            try:
+                image['metadata'] = json.loads(next_image[5])
+            except (ValueError, TypeError, json.JSONDecodeError) as e:
+                logger.error(f"Error parsing metadata for image {next_image[1]}: {e}")
+                image['metadata'] = {}
+        
+        # Update queue position for this image
+        new_position = max_position + 1
+        cursor.execute("UPDATE images SET queue_position = ? WHERE image_id = ?", (new_position, image['image_id']))
+        conn.commit()
+        
+        logger.info(f"Selected next OPEN image in queue: {image['image_id']} (position {new_position}, status: {image['status']})")
+        conn.close()
+        return image
+        
+    except Exception as e:
+        logger.error(f"Error getting next image in queue: {e}")
+        return None
+
+def get_next_image_in_queue_with_percentage(group_b_percentages: Dict = None) -> Optional[Dict]:
+    """Get the next image in queue order with Group B percentage filtering."""
+    try:
+        # Get the next image in queue
+        image = get_next_image_in_queue()
+        
+        if not image or not group_b_percentages:
+            return image
+        
+        # Check percentage restrictions
+        metadata = image.get('metadata', {})
+        if isinstance(metadata, dict) and 'source_group_b_id' in metadata:
+            try:
+                source_group_b_id = int(metadata['source_group_b_id'])
+                
+                if source_group_b_id in group_b_percentages:
+                    percentage = group_b_percentages[source_group_b_id]
+                    
+                    # Roll for percentage chance
+                    import random
+                    random_chance = random.randint(1, 100)
+                    logger.info(f"Image {image['image_id']} from Group B {source_group_b_id} has {percentage}% chance, rolled {random_chance}")
+                    
+                    if random_chance <= percentage:
+                        logger.info(f"Image {image['image_id']} passed percentage check")
+                        return image
+                    else:
+                        logger.info(f"Image {image['image_id']} failed percentage check, trying next image")
+                        # Recursively try next image (but limit recursion)
+                        return get_next_image_in_queue_with_percentage(group_b_percentages)
+                
+            except (ValueError, TypeError) as e:
+                logger.error(f"Error processing metadata for image {image['image_id']}: {e}")
+        
+        # No percentage restriction or error, return image
+        return image
+        
+    except Exception as e:
+        logger.error(f"Error getting next image in queue with percentage: {e}")
+        return None 
+
+def reset_queue_positions() -> bool:
+    """Reset all queue positions to start fresh."""
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Check if queue_position column exists
+        cursor.execute("PRAGMA table_info(images)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'queue_position' in columns:
+            cursor.execute("UPDATE images SET queue_position = 0")
+            conn.commit()
+            logger.info("Reset all queue positions to 0")
+        
+        conn.close()
+        return True
+    except Exception as e:
+        logger.error(f"Error resetting queue positions: {e}")
+        return False
+
+def get_queue_status() -> Dict[str, Any]:
+    """Get current queue status for debugging."""
+    try:
+        init_db()
+        conn = sqlite3.connect(DB_FILE)
+        cursor = conn.cursor()
+        
+        # Check if queue_position column exists
+        cursor.execute("PRAGMA table_info(images)")
+        columns = [col[1] for col in cursor.fetchall()]
+        
+        if 'queue_position' not in columns:
+            return {"error": "Queue system not initialized"}
+        
+        # Get all images with queue positions
+        cursor.execute("SELECT image_id, number, status, queue_position FROM images ORDER BY rowid ASC")
+        rows = cursor.fetchall()
+        
+        if not rows:
+            return {"error": "No images in queue"}
+        
+        # Separate open and closed images
+        open_images = [row for row in rows if row[2] == 'open']
+        closed_images = [row for row in rows if row[2] == 'closed']
+        
+        max_position = max(row[3] or 0 for row in rows)
+        
+        # Find current position in queue
+        current_image = None
+        for row in rows:
+            if (row[3] or 0) == max_position:
+                current_image = {"id": row[0], "number": row[1], "status": row[2], "position": row[3]}
+                break
+        
+        # Find next OPEN image
+        next_image = None
+        if current_image:
+            current_rowid = None
+            cursor.execute("SELECT rowid FROM images WHERE image_id = ?", (current_image["id"],))
+            result = cursor.fetchone()
+            if result:
+                current_rowid = result[0]
+                
+                # Find next OPEN image after current
+                cursor.execute("SELECT image_id, number FROM images WHERE rowid > ? AND status = 'open' ORDER BY rowid ASC LIMIT 1", (current_rowid,))
+                result = cursor.fetchone()
+                if result:
+                    next_image = {"id": result[0], "number": result[1], "status": "open"}
+                else:
+                    # Cycle back to first OPEN image
+                    cursor.execute("SELECT image_id, number FROM images WHERE status = 'open' ORDER BY rowid ASC LIMIT 1")
+                    result = cursor.fetchone()
+                    if result:
+                        next_image = {"id": result[0], "number": result[1], "status": "open"}
+        
+        conn.close()
+        
+        return {
+            "total_images": len(rows),
+            "open_images": len(open_images),
+            "closed_images": len(closed_images),
+            "max_position": max_position,
+            "current_image": current_image,
+            "next_image": next_image,
+            "queue_order": [{"id": row[0], "number": row[1], "status": row[2], "position": row[3] or 0} for row in rows]
+        }
+        
+    except Exception as e:
+        logger.error(f"Error getting queue status: {e}")
+        return {"error": str(e)} 
