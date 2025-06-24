@@ -676,6 +676,27 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     
     logger.info(f"Selected image: {image['image_id']}")
     
+    # Get metadata and target Group B BEFORE sending image to Group A
+    metadata = image.get('metadata', {})
+    logger.info(f"Image metadata: {metadata}")
+    
+    # Get the proper Group B ID for this image - this is the critical part
+    target_group_b_id = get_group_b_for_image(image['image_id'], metadata)
+    logger.info(f"Target Group B ID for forwarding: {target_group_b_id}")
+    
+    # Check if we have a valid Group B
+    if target_group_b_id is None:
+        logger.error("No Group B configured! Cannot forward message.")
+        update.message.reply_text("Error: No Group B configured. Please ask admin to set up Group B.")
+        return
+    
+    # Check if the amount is within the allowed range for this Group B BEFORE sending anything
+    if not is_amount_within_group_b_range(target_group_b_id, amount_int):
+        logger.info(f"Amount {amount_int} is not within allowed range for Group B {target_group_b_id}. Remaining completely silent.")
+        # Set image status back to open since we're not processing it
+        db.set_image_status(image['image_id'], "open")
+        return
+    
     # Send the image
     try:
         sent_msg = update.message.reply_photo(
@@ -686,27 +707,6 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
         
         # Forward the content to the appropriate Group B chat
         try:
-            # Get metadata if available
-            metadata = image.get('metadata', {})
-            logger.info(f"Image metadata: {metadata}")
-            
-            # Get the proper Group B ID for this image - this is the critical part
-            target_group_b_id = get_group_b_for_image(image['image_id'], metadata)
-            logger.info(f"Target Group B ID for forwarding: {target_group_b_id}")
-            
-            # Check if we have a valid Group B
-            if target_group_b_id is None:
-                logger.error("No Group B configured! Cannot forward message.")
-                update.message.reply_text("Error: No Group B configured. Please ask admin to set up Group B.")
-                return
-            
-            # Check if the amount is within the allowed range for this Group B
-            if not is_amount_within_group_b_range(target_group_b_id, amount_int):
-                logger.info(f"Amount {amount_int} is not within allowed range for Group B {target_group_b_id}. Remaining silent.")
-                # Set image status back to open since we're not processing it
-                db.set_image_status(image['image_id'], "open")
-                return
-            
             # Make EXTRA sure this is a valid Group B ID
             valid_group_b = False
             try:
