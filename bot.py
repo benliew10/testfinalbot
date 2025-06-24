@@ -72,6 +72,7 @@ PENDING_CUSTOM_AMOUNTS_FILE = "pending_custom_amounts.json"
 SETTINGS_FILE = "bot_settings.json"
 GROUP_B_PERCENTAGES_FILE = "group_b_percentages.json"
 GROUP_B_CLICK_MODE_FILE = "group_b_click_mode.json"
+GROUP_B_AMOUNT_RANGES_FILE = "group_b_amount_ranges.json"
 
 # Message IDs mapping for forwarded messages
 forwarded_msgs: Dict[str, Dict] = {}
@@ -87,6 +88,9 @@ pending_custom_amounts: Dict[int, Dict] = {}  # Format: {message_id: {img_id, am
 
 # Store Group B percentage settings for image distribution
 group_b_percentages: Dict[int, int] = {}  # Format: {group_b_id: percentage}
+
+# Store Group B amount ranges for filtering triggers from Group A
+group_b_amount_ranges: Dict[int, Dict[str, int]] = {}  # Format: {group_b_id: {"min": min_amount, "max": max_amount}}
 
 # Function to safely send messages with retry logic
 def safe_send_message(context, chat_id, text, reply_to_message_id=None, max_retries=3, retry_delay=2):
@@ -182,11 +186,19 @@ def save_config_data():
             logger.info(f"Saved Group B click mode settings to file")
     except Exception as e:
         logger.error(f"Error saving Group B click mode: {e}")
+    
+    # Save Group B Amount Ranges
+    try:
+        with open(GROUP_B_AMOUNT_RANGES_FILE, 'w') as f:
+            json.dump(group_b_amount_ranges, f, indent=2)
+            logger.info(f"Saved Group B amount ranges to file")
+    except Exception as e:
+        logger.error(f"Error saving Group B amount ranges: {e}")
 
 # Function to load all configuration data
 def load_config_data():
     """Load all configuration data from files."""
-    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE
+    global GROUP_A_IDS, GROUP_B_IDS, GROUP_ADMINS, FORWARDING_ENABLED, group_b_percentages, GROUP_B_CLICK_MODE, group_b_amount_ranges
     
     # Load Group A IDs
     if os.path.exists(GROUP_A_IDS_FILE):
@@ -252,11 +264,35 @@ def load_config_data():
         except Exception as e:
             logger.error(f"Error loading Group B click mode: {e}")
             GROUP_B_CLICK_MODE = {}
+    
+    # Load Group B Amount Ranges
+    if os.path.exists(GROUP_B_AMOUNT_RANGES_FILE):
+        try:
+            with open(GROUP_B_AMOUNT_RANGES_FILE, 'r') as f:
+                amount_ranges_json = json.load(f)
+                # Convert keys back to integers
+                group_b_amount_ranges = {int(group_id): ranges for group_id, ranges in amount_ranges_json.items()}
+                logger.info(f"Loaded Group B amount ranges from file: {group_b_amount_ranges}")
+        except Exception as e:
+            logger.error(f"Error loading Group B amount ranges: {e}")
+            group_b_amount_ranges = {}
 
 # Check if user is a global admin
 def is_global_admin(user_id):
     """Check if user is a global admin."""
     return user_id in GLOBAL_ADMINS
+
+def is_amount_within_group_b_range(group_b_id: int, amount: int) -> bool:
+    """Check if the amount is within the allowed range for a specific Group B."""
+    if group_b_id not in group_b_amount_ranges:
+        # If no range is set for this Group B, allow all amounts (preserve original behavior)
+        return True
+    
+    range_config = group_b_amount_ranges[group_b_id]
+    min_amount = range_config.get("min", 20)  # Default to existing bot minimum
+    max_amount = range_config.get("max", 5000)  # Default to existing bot maximum
+    
+    return min_amount <= amount <= max_amount
 
 # Check if user is a group admin for a specific chat
 def is_group_admin(user_id, chat_id):
@@ -406,10 +442,17 @@ def help_command(update: Update, context: CallbackContext) -> None:
 开启转发/关闭转发 - Toggle forwarding between Group B and Group A
 设置群聊A/设置群聊B - Set current chat as Group A or Group B
 
+*Group B Amount Range Commands (Private Chat Only):*
+/setgroupbrange <group_b_id> <min> <max> - Set amount range for a Group B
+/removegroupbrange <group_b_id> - Remove amount range for a Group B
+/listgroupbranges - List all Group B amount ranges
+/listgroupb - List all Group B IDs with their ranges
+
 *How Images Work:*
 📋 Images are sent in QUEUE ORDER (setup order), one by one
 🔄 When all images are used, it cycles back to the first image
 🎯 This ensures fair distribution in the order images were created
+🎯 Group B Amount Ranges: Only Group B chats with matching amount ranges will receive images
 """
 
     update.message.reply_text(help_text, parse_mode=ParseMode.MARKDOWN)
@@ -657,6 +700,13 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
                 update.message.reply_text("Error: No Group B configured. Please ask admin to set up Group B.")
                 return
             
+            # Check if the amount is within the allowed range for this Group B
+            if not is_amount_within_group_b_range(target_group_b_id, amount_int):
+                logger.info(f"Amount {amount_int} is not within allowed range for Group B {target_group_b_id}. Remaining silent.")
+                # Set image status back to open since we're not processing it
+                db.set_image_status(image['image_id'], "open")
+                return
+            
             # Make EXTRA sure this is a valid Group B ID
             valid_group_b = False
             try:
@@ -772,6 +822,15 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
             
             # Get the proper Group B ID for this image
             target_group_b_id = get_group_b_for_image(image['image_id'], metadata)
+            
+            # Check if the amount is within the allowed range for this Group B
+            if not is_amount_within_group_b_range(target_group_b_id, int(amount)):
+                logger.info(f"Amount {amount} is not within allowed range for Group B {target_group_b_id}. Remaining silent.")
+                # Set image status back to open since we're not processing it
+                db.set_image_status(image['image_id'], "open")
+                # Remove the pending request
+                del pending_requests[request_msg_id]
+                return
             
             # First send the image to Group A
             sent_msg = update.message.reply_photo(
@@ -2365,6 +2424,12 @@ def register_handlers(dispatcher):
     dispatcher.add_handler(CommandHandler("resetqueue", handle_reset_queue))
     dispatcher.add_handler(CommandHandler("queuestatus", handle_queue_status))
     
+    # Group B amount range management commands (for global admins only, private chat only)
+    dispatcher.add_handler(CommandHandler("setgroupbrange", handle_set_group_b_amount_range))
+    dispatcher.add_handler(CommandHandler("removegroupbrange", handle_remove_group_b_amount_range))
+    dispatcher.add_handler(CommandHandler("listgroupbranges", handle_list_group_b_amount_ranges))
+    dispatcher.add_handler(CommandHandler("listgroupb", handle_list_group_b_ids))
+    
     # Handler for admin image sending
     dispatcher.add_handler(MessageHandler(
         Filters.text & Filters.regex(r'^发图'),
@@ -3085,6 +3150,220 @@ def handle_queue_status(update: Update, context: CallbackContext) -> None:
     except Exception as e:
         logger.error(f"Error in handle_queue_status: {e}")
         update.message.reply_text("❌ Error getting queue status")
+
+def handle_set_group_b_amount_range(update: Update, context: CallbackContext) -> None:
+    """Handle setting amount range for a specific Group B - ONLY in private chat for global admins."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Check if this is a private chat (chat_id will be positive for private chats)
+    if chat_id < 0:
+        logger.info(f"Group B amount range command used in group chat {chat_id}, ignoring")
+        return
+    
+    # Check if user is a global admin
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    # Parse command arguments
+    try:
+        args = context.args
+        if len(args) != 3:
+            update.message.reply_text(
+                "📋 Usage: /setgroupbrange <group_b_id> <min_amount> <max_amount>\n\n"
+                "Example: /setgroupbrange -1002648811668 100 1000\n\n"
+                "💡 Use /listgroupb to see all Group B IDs"
+            )
+            return
+        
+        group_b_id = int(args[0])
+        min_amount = int(args[1])
+        max_amount = int(args[2])
+        
+        # Validate inputs
+        if min_amount < 20 or max_amount > 5000:
+            update.message.reply_text("❌ Amount range must be within 20-5000")
+            return
+        
+        if min_amount >= max_amount:
+            update.message.reply_text("❌ Minimum amount must be less than maximum amount")
+            return
+        
+        # Check if group_b_id is valid
+        if group_b_id not in GROUP_B_IDS:
+            update.message.reply_text(f"❌ Group B ID {group_b_id} is not registered. Use /listgroupb to see valid Group B IDs.")
+            return
+        
+        # Set the range
+        group_b_amount_ranges[group_b_id] = {
+            "min": min_amount,
+            "max": max_amount
+        }
+        
+        # Save configuration
+        save_config_data()
+        
+        update.message.reply_text(
+            f"✅ Amount range set for Group B {group_b_id}:\n"
+            f"💰 Min: {min_amount}\n"
+            f"💰 Max: {max_amount}\n\n"
+            f"🔔 This Group B will only receive images when Group A sends amounts between {min_amount} and {max_amount}"
+        )
+        
+        logger.info(f"Global admin {user_id} set amount range for Group B {group_b_id}: {min_amount}-{max_amount}")
+        
+    except (ValueError, IndexError) as e:
+        logger.error(f"Error in handle_set_group_b_amount_range: {e}")
+        update.message.reply_text(
+            "❌ Invalid format. Use: /setgroupbrange <group_b_id> <min_amount> <max_amount>\n\n"
+            "Example: /setgroupbrange -1002648811668 100 1000"
+        )
+    except Exception as e:
+        logger.error(f"Error in handle_set_group_b_amount_range: {e}")
+        update.message.reply_text("❌ Error setting Group B amount range")
+
+def handle_remove_group_b_amount_range(update: Update, context: CallbackContext) -> None:
+    """Handle removing amount range for a specific Group B - ONLY in private chat for global admins."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Check if this is a private chat
+    if chat_id < 0:
+        logger.info(f"Group B amount range removal command used in group chat {chat_id}, ignoring")
+        return
+    
+    # Check if user is a global admin
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    # Parse command arguments
+    try:
+        args = context.args
+        if len(args) != 1:
+            update.message.reply_text(
+                "📋 Usage: /removegroupbrange <group_b_id>\n\n"
+                "Example: /removegroupbrange -1002648811668\n\n"
+                "💡 Use /listgroupbranges to see all configured ranges"
+            )
+            return
+        
+        group_b_id = int(args[0])
+        
+        # Check if range exists
+        if group_b_id not in group_b_amount_ranges:
+            update.message.reply_text(f"❌ No amount range is set for Group B {group_b_id}")
+            return
+        
+        # Remove the range
+        removed_range = group_b_amount_ranges.pop(group_b_id)
+        
+        # Save configuration
+        save_config_data()
+        
+        update.message.reply_text(
+            f"✅ Amount range removed for Group B {group_b_id}\n"
+            f"🗑️ Previous range: {removed_range['min']}-{removed_range['max']}\n\n"
+            f"🔔 This Group B will now receive all images (default behavior)"
+        )
+        
+        logger.info(f"Global admin {user_id} removed amount range for Group B {group_b_id}")
+        
+    except (ValueError, IndexError) as e:
+        logger.error(f"Error in handle_remove_group_b_amount_range: {e}")
+        update.message.reply_text(
+            "❌ Invalid format. Use: /removegroupbrange <group_b_id>\n\n"
+            "Example: /removegroupbrange -1002648811668"
+        )
+    except Exception as e:
+        logger.error(f"Error in handle_remove_group_b_amount_range: {e}")
+        update.message.reply_text("❌ Error removing Group B amount range")
+
+def handle_list_group_b_amount_ranges(update: Update, context: CallbackContext) -> None:
+    """List all Group B amount range settings - ONLY in private chat for global admins."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Check if this is a private chat
+    if chat_id < 0:
+        logger.info(f"Group B amount ranges list command used in group chat {chat_id}, ignoring")
+        return
+    
+    # Check if user is a global admin
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    try:
+        if not group_b_amount_ranges:
+            update.message.reply_text(
+                "📋 No Group B amount ranges are configured.\n\n"
+                "💡 All Group B chats will receive images for any amount (20-5000)\n\n"
+                "Use /setgroupbrange to set specific ranges for Group B chats."
+            )
+            return
+        
+        message = "📋 Group B Amount Ranges:\n\n"
+        
+        for group_id, range_config in group_b_amount_ranges.items():
+            min_amount = range_config.get("min", 20)
+            max_amount = range_config.get("max", 5000)
+            message += f"🎯 Group B {group_id}:\n"
+            message += f"   💰 Range: {min_amount} - {max_amount}\n\n"
+        
+        message += "💡 Group B chats not listed will receive images for any amount (20-5000)\n\n"
+        message += "Commands:\n"
+        message += "• /setgroupbrange <id> <min> <max> - Set range\n"
+        message += "• /removegroupbrange <id> - Remove range\n"
+        message += "• /listgroupb - Show all Group B IDs"
+        
+        update.message.reply_text(message)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_list_group_b_amount_ranges: {e}")
+        update.message.reply_text("❌ Error listing Group B amount ranges")
+
+def handle_list_group_b_ids(update: Update, context: CallbackContext) -> None:
+    """List all Group B IDs - ONLY in private chat for global admins."""
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+    
+    # Check if this is a private chat
+    if chat_id < 0:
+        logger.info(f"Group B IDs list command used in group chat {chat_id}, ignoring")
+        return
+    
+    # Check if user is a global admin
+    if not is_global_admin(user_id):
+        update.message.reply_text("⚠️ Only global admins can use this command.")
+        return
+    
+    try:
+        if not GROUP_B_IDS:
+            update.message.reply_text("📋 No Group B chats are registered.")
+            return
+        
+        message = "📋 Registered Group B IDs:\n\n"
+        
+        for i, group_id in enumerate(GROUP_B_IDS, 1):
+            # Check if this Group B has an amount range configured
+            if group_id in group_b_amount_ranges:
+                range_config = group_b_amount_ranges[group_id]
+                range_text = f" (Range: {range_config['min']}-{range_config['max']})"
+            else:
+                range_text = " (No range - accepts all amounts)"
+                
+            message += f"{i}. {group_id}{range_text}\n"
+        
+        message += f"\n📊 Total: {len(GROUP_B_IDS)} Group B chat(s)\n\n"
+        message += "💡 Use /setgroupbrange to set amount ranges for specific Group B chats"
+        
+        update.message.reply_text(message)
+        
+    except Exception as e:
+        logger.error(f"Error in handle_list_group_b_ids: {e}")
+        update.message.reply_text("❌ Error listing Group B IDs")
 
 if __name__ == '__main__':
     main() 
