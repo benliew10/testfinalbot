@@ -1220,18 +1220,9 @@ def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
     logger.info(f"Generated message link: {message_link}")
     
     # Format the forwarded message for Group B
-    username_info = f"@{user_username}" if user_username else "无用户名"
-    
-    forwarded_message = f"""
-📢 **群A用户回复消息**
-
-👤 **用户**: {user_display_name} ({username_info})
-🏷️ **群组**: {chat_title}
-💬 **消息内容**: {reply_text}
-🔗 **消息链接**: {message_link}
-
-━━━━━━━━━━━━━━━━━━━━
-"""
+    forwarded_message = f"""{chat_title}--{user_display_name}
+内容- {reply_text}
+链接- {message_link}"""
     
     # Send to all Group B chats
     for group_b_id in GROUP_B_IDS:
