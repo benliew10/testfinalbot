@@ -483,7 +483,22 @@ def set_image(update: Update, context: CallbackContext) -> None:
     file_id = update.message.reply_to_message.photo[-1].file_id
     image_id = f"img_{len(db.get_all_images()) + 1}"
     
-    if db.add_image(image_id, number, file_id):
+    # Get user information who set the image
+    user_id = update.effective_user.id
+    user_name = update.effective_user.first_name or ""
+    user_last_name = update.effective_user.last_name or ""
+    user_username = update.effective_user.username
+    user_display_name = f"{user_name} {user_last_name}".strip()
+    
+    # Create metadata with user information
+    metadata_dict = {
+        'set_by_user_id': user_id,
+        'set_by_user_name': user_display_name,
+        'set_by_username': user_username
+    }
+    metadata = json.dumps(metadata_dict)
+    
+    if db.add_image(image_id, number, file_id, metadata=metadata):
         update.message.reply_text(f"Image set with number {number} and status 'open'.")
     else:
         update.message.reply_text("Failed to set image. It might already exist.")
@@ -699,9 +714,23 @@ def handle_group_a_message(update: Update, context: CallbackContext) -> None:
     
     # Send the image
     try:
+        # Get user mention who set the image
+        user_mention = ""
+        if 'metadata' in image and isinstance(image['metadata'], dict):
+            set_by_username = image['metadata'].get('set_by_username')
+            set_by_user_name = image['metadata'].get('set_by_user_name', '')
+            
+            if set_by_username:
+                user_mention = f" @{set_by_username}"
+            elif set_by_user_name:
+                user_mention = f" {set_by_user_name}"
+        
+        # Create caption with user mention
+        caption = f"🌟 群: {image['number']} 🌟{user_mention}"
+        
         sent_msg = update.message.reply_photo(
             photo=image['file_id'],
-            caption=f"🌟 群: {image['number']} 🌟"
+            caption=caption
         )
         logger.info(f"Image sent successfully with message_id: {sent_msg.message_id}")
         
@@ -833,9 +862,23 @@ def handle_approval(update: Update, context: CallbackContext) -> None:
                 return
             
             # First send the image to Group A
+            # Get user mention who set the image
+            user_mention = ""
+            if 'metadata' in image and isinstance(image['metadata'], dict):
+                set_by_username = image['metadata'].get('set_by_username')
+                set_by_user_name = image['metadata'].get('set_by_user_name', '')
+                
+                if set_by_username:
+                    user_mention = f" @{set_by_username}"
+                elif set_by_user_name:
+                    user_mention = f" {set_by_user_name}"
+            
+            # Create caption with user mention
+            caption = f"🌟 群: {image['number']} 🌟{user_mention}"
+            
             sent_msg = update.message.reply_photo(
                 photo=image['file_id'],
-                caption=f"🌟 群: {image['number']} 🌟"
+                caption=caption
             )
             logger.info(f"Image sent to Group A with message_id: {sent_msg.message_id}")
             
@@ -1910,10 +1953,19 @@ def handle_set_group_image(update: Update, context: CallbackContext) -> None:
     
     # Save the image with additional metadata
     try:
+        # Get user information who set the image
+        user_name = update.effective_user.first_name or ""
+        user_last_name = update.effective_user.last_name or ""
+        user_username = update.effective_user.username
+        user_display_name = f"{user_name} {user_last_name}".strip()
+        
         # Store the metadata in a separate JSON field - make sure source_group_b_id is explicitly an int
         metadata_dict = {
             'source_group_b_id': source_group_b_id,
-            'target_group_a_id': target_group_a_id
+            'target_group_a_id': target_group_a_id,
+            'set_by_user_id': user_id,
+            'set_by_user_name': user_display_name,
+            'set_by_username': user_username
         }
         
         # Convert to JSON string
