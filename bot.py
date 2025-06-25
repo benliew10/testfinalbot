@@ -1149,56 +1149,103 @@ def process_group_b_response(update, context, img_id, msg_data, number, original
 
 # Add handler for replies to bot messages in Group A
 def handle_group_a_reply(update: Update, context: CallbackContext) -> None:
-    """Handle replies to bot messages in Group A silently (no auto-replies)."""
-    # Completely silent handler - no processing, no responses
-    logger.info(f"Reply received in Group A - ignoring silently")
-    return
-    
-    # All the processing below has been commented out to ensure complete silence
-    """
+    """Handle replies to bot messages in Group A - Forward replies to Group B with user info and message link."""
     chat_id = update.effective_chat.id
     message_id = update.message.message_id
     reply_to_message_id = update.message.reply_to_message.message_id if update.message.reply_to_message else None
     
-    logger.info(f"Reply received in chat {chat_id} to message {reply_to_message_id}")
+    logger.info(f"Reply received in Group A chat {chat_id} to message {reply_to_message_id}")
     
     # Check if replying to a message
     if not update.message.reply_to_message:
         logger.info("Not a reply to any message")
         return
     
-    # Check if replying to a photo message (our bot images have photos)
-    if not update.message.reply_to_message.photo:
-        logger.info("Not replying to a photo message")
+    # Check if replying to a bot message (either photo or text from bot)
+    if not (update.message.reply_to_message.from_user and 
+            update.message.reply_to_message.from_user.is_bot):
+        logger.info("Not replying to a bot message")
         return
     
-    logger.info("Reply to photo message detected in Group A")
-    logger.info(f"Current forwarded_msgs: {forwarded_msgs}")
+    # Get user information
+    user = update.message.from_user
+    user_first_name = user.first_name or "Unknown"
+    user_last_name = user.last_name or ""
+    user_username = user.username
+    user_display_name = f"{user_first_name} {user_last_name}".strip()
     
-    # Find the image ID for this message - just log information, don't reply
-    found = False
-    for img_id, msg_data in forwarded_msgs.items():
-        group_a_msg_id = msg_data.get('group_a_msg_id')
-        logger.info(f"Checking image {img_id} with group_a_msg_id: {group_a_msg_id}")
-        
-        # Check if the message IDs match
-        if group_a_msg_id and str(group_a_msg_id) == str(reply_to_message_id):
-            logger.info(f"Found matching image: {img_id}")
-            found = True
-            
-            # Check if there's a response from Group B - just log it
-            if img_id in group_b_responses:
-                response = group_b_responses[img_id]
-                logger.info(f"Group B response for image {img_id}: {response}")
-            else:
-                logger.info(f"No Group B response found for image {img_id}")
-            
-            break
+    # Get chat information
+    chat = update.effective_chat
+    chat_title = chat.title or "Private Chat"
     
-    if not found:
-        logger.info(f"No matching image found for reply to message {reply_to_message_id}")
-        # No response if no match
-    """
+    # Get reply message content (support different message types)
+    reply_text = ""
+    if update.message.text:
+        reply_text = update.message.text
+    elif update.message.photo:
+        reply_text = "[图片]" + (f" {update.message.caption}" if update.message.caption else "")
+    elif update.message.video:
+        reply_text = "[视频]" + (f" {update.message.caption}" if update.message.caption else "")
+    elif update.message.document:
+        reply_text = "[文件]" + (f" {update.message.caption}" if update.message.caption else "")
+    elif update.message.voice:
+        reply_text = "[语音消息]"
+    elif update.message.audio:
+        reply_text = "[音频]" + (f" {update.message.caption}" if update.message.caption else "")
+    elif update.message.sticker:
+        reply_text = f"[贴纸] {update.message.sticker.emoji if update.message.sticker.emoji else ''}"
+    elif update.message.location:
+        reply_text = "[位置信息]"
+    elif update.message.contact:
+        reply_text = "[联系人信息]"
+    else:
+        reply_text = "[其他消息类型]"
+    
+    # Create message link
+    # For public channels/groups: https://t.me/channel_username/message_id
+    # For private groups: https://t.me/c/chat_id/message_id (remove the -100 prefix from supergroup IDs)
+    message_link = ""
+    if chat.username:
+        # Public group/channel
+        message_link = f"https://t.me/{chat.username}/{message_id}"
+    else:
+        # Private group - remove -100 prefix for supergroups
+        chat_id_str = str(chat_id)
+        if chat_id_str.startswith("-100"):
+            clean_chat_id = chat_id_str[4:]  # Remove -100 prefix
+            message_link = f"https://t.me/c/{clean_chat_id}/{message_id}"
+        else:
+            message_link = f"https://t.me/c/{abs(chat_id)}/{message_id}"
+    
+    logger.info(f"Generated message link: {message_link}")
+    
+    # Format the forwarded message for Group B
+    username_info = f"@{user_username}" if user_username else "无用户名"
+    
+    forwarded_message = f"""
+📢 **群A用户回复消息**
+
+👤 **用户**: {user_display_name} ({username_info})
+🏷️ **群组**: {chat_title}
+💬 **消息内容**: {reply_text}
+🔗 **消息链接**: {message_link}
+
+━━━━━━━━━━━━━━━━━━━━
+"""
+    
+    # Send to all Group B chats
+    for group_b_id in GROUP_B_IDS:
+        try:
+            safe_send_message(
+                context=context,
+                chat_id=group_b_id,
+                text=forwarded_message
+            )
+            logger.info(f"Forwarded Group A reply to Group B {group_b_id}")
+        except Exception as e:
+            logger.error(f"Error forwarding reply to Group B {group_b_id}: {e}")
+    
+    logger.info(f"Successfully processed Group A reply and forwarded to Group B chats")
 
 def button_callback(update: Update, context: CallbackContext) -> None:
     """Handle button callbacks."""
@@ -2522,10 +2569,10 @@ def register_handlers(dispatcher):
         run_async=True
     ))
     
-    # Then replies to bot messages in Group A
+    # Then replies to bot messages in Group A (support all message types)
     if GROUP_A_IDS:
         dispatcher.add_handler(MessageHandler(
-            Filters.text & Filters.reply & Filters.chat(list(GROUP_A_IDS)),
+            Filters.reply & Filters.chat(list(GROUP_A_IDS)),
             handle_group_a_reply,
             run_async=True
         ))
